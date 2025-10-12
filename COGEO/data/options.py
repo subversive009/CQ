@@ -57,6 +57,11 @@ class Options_KITTI:
         self.lr_decay_step = 0.25
         self.lr_decay_scale = 0.5
         self.val_freq = 100
+        self.enable_pose_loss = True
+        self.pose_loss_weight = 0.1
+        self.pose_warmup_epoch = 5
+        self.soft_corr_temperature = 0.01
+        self.min_pose_keypoints = 16
 
 class Options_Nuscenes:
     def __init__(self):
@@ -113,6 +118,11 @@ class Options_Nuscenes:
         self.lr_decay_step = 0.25
         self.lr_decay_scale = 0.5
         self.val_freq = 100
+        self.enable_pose_loss = True
+        self.pose_loss_weight = 0.1
+        self.pose_warmup_epoch = 5
+        self.soft_corr_temperature = 0.01
+        self.min_pose_keypoints = 16
 
 
 

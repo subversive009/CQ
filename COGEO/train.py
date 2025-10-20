@@ -33,6 +33,7 @@ def test_acc(model,testdataloader,opt,topk_range = 5):
     t_diff_set=[]
     angles_diff_set=[]
     topk_list = torch.zeros(6, topk_range)
+    last_true_count = 1
     count = 0
     mode = 'val'
     for step,data in enumerate(testdataloader):
@@ -82,17 +83,23 @@ def test_acc(model,testdataloader,opt,topk_range = 5):
         img_xy_flatten_inline=torch.gather(img_xy_flatten,index= coarse_img_kpt_idx.unsqueeze(0).expand(2,opt.num_kpt),dim=-1)
 
         pc_xyz_projection=torch.mm(K_4,(torch.mm(P[0:3,0:3],pc_xyz_inline)+P[0:3,3:]))
-        #pc_xy_projection=torch.floor(pc_xyz_projection[:,0:2,:]/pc_xyz_projection[:,2:,:]).float()
-        pc_xy_projection=pc_xyz_projection[0:2,:]/pc_xyz_projection[2:,:]
+        depth = pc_xyz_projection[2, :]
+        safe_depth = torch.clamp(pc_xyz_projection[2:,:], min=opt.positive_depth_epsilon)
+        pc_xy_projection=pc_xyz_projection[0:2,:]/safe_depth
+        depth_mask = (depth > opt.positive_depth_epsilon).float()
 
         correspondence_mask=(torch.sqrt(torch.sum(torch.square(img_xy_flatten_inline.unsqueeze(-1)-pc_xy_projection.unsqueeze(-2)),dim=0)) <= opt.dist_thres).float()
-    
+        correspondence_mask = correspondence_mask * depth_mask.unsqueeze(0)
+
         dist_corr = 1 - torch.sum(img_features_flatten_inline.unsqueeze(-1)*pc_features_inline.unsqueeze(-2), dim=0)
         # correspondence_mask = torch.squeeze(correspondence_mask)
         # dist_corr = torch.squeeze(dist_corr)
         dist_mask = correspondence_mask * dist_corr  # only match got non-zero value
         true_index_list = torch.nonzero(dist_mask, as_tuple=False)
         true_value_list = dist_mask[true_index_list[:, 0], true_index_list[:, 1]].tolist()
+        if len(true_value_list) == 0:
+            continue
+        last_true_count = len(true_value_list)
         sorted_dist, indices = torch.sort(dist_corr, dim=-1, descending=False)
         topk = range(1,topk_range + 1)
  
@@ -104,7 +111,7 @@ def test_acc(model,testdataloader,opt,topk_range = 5):
                     if candidate in true_value_list:
                         topk_list[count, k - 1] += 1
         count += 1
-    acc = torch.mean(topk_list / len(true_value_list), dim=0)
+    acc = torch.mean(topk_list / last_true_count, dim=0)
     # print(acc)
     # return np.mean(np.array(t_diff_set)),np.mean(np.array(angles_diff_set))
     return acc
@@ -248,10 +255,14 @@ if __name__=='__main__':
             img_xy_flatten_inline=torch.gather(img_xy_flatten,index=coarse_img_kpt_idx.unsqueeze(0).expand(2,opt.num_kpt),dim=-1)
             # [3, 128]
             pc_xyz_projection=torch.mm(K_4,(torch.mm(P[0:3,0:3],pc_xyz_inline)+P[0:3,3:]))
+            depth = pc_xyz_projection[2, :]
+            safe_depth = torch.clamp(pc_xyz_projection[2:,:], min=opt.positive_depth_epsilon)
             #pc_xy_projection=torch.floor(pc_xyz_projection[:,0:2,:]/pc_xyz_projection[:,2:,:]).float()
-            pc_xy_projection=pc_xyz_projection[0:2,:]/pc_xyz_projection[2:,:]
+            pc_xy_projection=pc_xyz_projection[0:2,:]/safe_depth
+            depth_mask = (depth > opt.positive_depth_epsilon)
             # [128, 128]
             correspondence_mask=(torch.sqrt(torch.sum(torch.square(img_xy_flatten_inline.unsqueeze(-1)-pc_xy_projection.unsqueeze(-2)),dim=0)) <= opt.dist_thres).float()
+            correspondence_mask = correspondence_mask * depth_mask.unsqueeze(0).float()
 
             # loss_desc = coarse_circle_loss(img_features_flatten_inline,pc_features_inline,correspondence_mask)
             loss_desc,dists=desc_loss(img_features_flatten_inline,pc_features_inline,correspondence_mask,pos_margin = opt.pos_margin,neg_margin = opt.neg_margin)
@@ -291,48 +302,56 @@ if __name__=='__main__':
             if (
                 opt.enable_pose_loss
                 and epoch >= opt.pose_warmup_epoch
-                and pc_xyz_inline.size(1) >= opt.min_pose_keypoints
             ):
                 try:
                     temp = max(opt.soft_corr_temperature, 1e-6)
-                    mutual_info = torch.matmul(
-                        pc_features_inline.transpose(0, 1),
-                        img_features_flatten
-                    ) / temp
-                    soft_matching_matrix = F.softmax(mutual_info, dim=-1)
-                    img_xy_grid = img_xy_flatten.transpose(0, 1)
-                    predicted_xy = torch.matmul(soft_matching_matrix, img_xy_grid)
-                    ones = torch.ones(
-                        predicted_xy.size(0), 1, device=predicted_xy.device
-                    )
-                    y_homo = torch.cat([predicted_xy, ones], dim=1)
-                    K4_inv = torch.inverse(K_4)
-                    y_norm = torch.matmul(y_homo, K4_inv.t())[:, :2]
-                    x_points = pc_xyz_inline.transpose(0, 1)
-                    epnp_solution = efficient_pnp(
-                        x_points.unsqueeze(0), y_norm.unsqueeze(0)
-                    )
-                    R_pred = epnp_solution.R.permute(0, 2, 1)
-                    t_pred = epnp_solution.T
-                    R_gt = P[0:3, 0:3].unsqueeze(0)
-                    t_gt = P[0:3, 3].unsqueeze(0)
-                    rot_loss = F.smooth_l1_loss(R_pred, R_gt)
-                    trans_loss = F.smooth_l1_loss(t_pred, t_gt)
-                    pose_loss = rot_loss + 0.01 * trans_loss
+                    valid_indices = torch.nonzero(depth_mask, as_tuple=False).squeeze(-1)
+                    if valid_indices.numel() >= opt.min_pose_keypoints:
+                        pc_pose_xyz = pc_xyz_inline[:, valid_indices]
+                        pc_pose_feats = pc_features_inline[:, valid_indices]
+                        pc_pose_feats = F.normalize(pc_pose_feats.transpose(0, 1), dim=-1)
+                        img_pose_feats = F.normalize(img_features_flatten.transpose(0, 1), dim=-1)
+                        mutual_info = torch.matmul(
+                            pc_pose_feats,
+                            img_pose_feats.transpose(0, 1)
+                        ) / temp
+                        soft_matching_matrix = F.softmax(mutual_info, dim=-1)
+                        img_xy_grid = img_xy_flatten.transpose(0, 1)
+                        predicted_xy = torch.matmul(soft_matching_matrix, img_xy_grid)
+                        ones = torch.ones(
+                            predicted_xy.size(0), 1, device=predicted_xy.device
+                        )
+                        y_homo = torch.cat([predicted_xy, ones], dim=1)
+                        K4_inv = torch.inverse(K_4)
+                        y_norm = torch.matmul(y_homo, K4_inv.t())[:, :2]
+                        x_points = pc_pose_xyz.transpose(0, 1)
+                        epnp_solution = efficient_pnp(
+                            x_points.unsqueeze(0), y_norm.unsqueeze(0)
+                        )
+                        R_pred = epnp_solution.R.permute(0, 2, 1)
+                        t_pred = epnp_solution.T
+                        R_gt = P[0:3, 0:3].unsqueeze(0)
+                        t_gt = P[0:3, 3].unsqueeze(0)
+                        rot_loss = F.smooth_l1_loss(R_pred, R_gt)
+                        trans_loss = F.smooth_l1_loss(t_pred, t_gt)
+                        pose_loss = rot_loss + 0.01 * trans_loss
 
-                    if torch.isnan(pose_loss):
-                        logger.debug('Pose loss is NaN at step %d, skipping pose supervision.', global_step)
+                        if not torch.isfinite(pose_loss):
+                            logger.debug('Pose loss is not finite at step %d, skipping pose supervision.', global_step)
+                            pose_loss = None
+                            loss = base_loss
+                        else:
+                            loss = base_loss + opt.pose_loss_weight * pose_loss
+
+                            with torch.no_grad():
+                                R_delta = torch.matmul(R_pred.detach(), R_gt.transpose(1, 2))
+                                trace = torch.diagonal(R_delta, dim1=1, dim2=2).sum(dim=1)
+                                trace = torch.clamp((trace - 1) / 2, -1 + 1e-6, 1 - 1e-6)
+                                pose_rot_err = torch.acos(trace) * (180.0 / math.pi)
+                                pose_trans_err = torch.norm(t_pred.detach() - t_gt, dim=1)
+                    else:
                         pose_loss = None
                         loss = base_loss
-                    else:
-                        loss = base_loss + opt.pose_loss_weight * pose_loss
-
-                        with torch.no_grad():
-                            R_delta = torch.matmul(R_pred.detach(), R_gt.transpose(1, 2))
-                            trace = torch.diagonal(R_delta, dim1=1, dim2=2).sum(dim=1)
-                            trace = torch.clamp((trace - 1) / 2, -1 + 1e-6, 1 - 1e-6)
-                            pose_rot_err = torch.acos(trace) * (180.0 / math.pi)
-                            pose_trans_err = torch.norm(t_pred.detach() - t_gt, dim=1)
                 except RuntimeError as pose_err:
                     logger.debug('Pose estimation failed at step %d: %s', global_step, pose_err)
             # back_start = time.time()

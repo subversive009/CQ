@@ -62,6 +62,7 @@ class Options_KITTI:
         self.pose_warmup_epoch = 5
         self.soft_corr_temperature = 0.01
         self.min_pose_keypoints = 16
+        self.positive_depth_epsilon = 1e-3
 
 class Options_Nuscenes:
     def __init__(self):
@@ -123,6 +124,7 @@ class Options_Nuscenes:
         self.pose_warmup_epoch = 5
         self.soft_corr_temperature = 0.01
         self.min_pose_keypoints = 16
+        self.positive_depth_epsilon = 1e-3
 
 
 

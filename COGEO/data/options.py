@@ -59,8 +59,9 @@ class Options_KITTI:
         self.val_freq = 100
         self.enable_pose_loss = True
         self.pose_loss_weight = 0.1
-        self.pose_warmup_epoch = 5
+        self.pose_warmup_epoch = 10
         self.soft_corr_temperature = 0.01
+        self.soft_corr_weight = 0.1
         self.min_pose_keypoints = 16
         self.positive_depth_epsilon = 1e-3
 
@@ -125,6 +126,7 @@ class Options_Nuscenes:
         self.soft_corr_temperature = 0.01
         self.min_pose_keypoints = 16
         self.positive_depth_epsilon = 1e-3
+        self.soft_corr_weight = 0.1
 
 
 

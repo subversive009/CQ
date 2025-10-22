@@ -92,8 +92,6 @@ def test_acc(model,testdataloader,opt,topk_range = 5):
         correspondence_mask = correspondence_mask * depth_mask.unsqueeze(0)
 
         dist_corr = 1 - torch.sum(img_features_flatten_inline.unsqueeze(-1)*pc_features_inline.unsqueeze(-2), dim=0)
-        # correspondence_mask = torch.squeeze(correspondence_mask)
-        # dist_corr = torch.squeeze(dist_corr)
         dist_mask = correspondence_mask * dist_corr  # only match got non-zero value
         true_index_list = torch.nonzero(dist_mask, as_tuple=False)
         true_value_list = dist_mask[true_index_list[:, 0], true_index_list[:, 1]].tolist()
@@ -253,6 +251,15 @@ if __name__=='__main__':
             img_features_flatten_inline=torch.gather(img_features_flatten,index=coarse_img_kpt_idx.unsqueeze(0).expand(img_features_flatten.size(0),opt.num_kpt),dim=-1)
             # [2, 128]
             img_xy_flatten_inline=torch.gather(img_xy_flatten,index=coarse_img_kpt_idx.unsqueeze(0).expand(2,opt.num_kpt),dim=-1)
+
+            # soft matching (coarse stage)
+            temp = max(opt.soft_corr_temperature, 1e-6)
+            pc_pose_feats = F.normalize(pc_features_inline.transpose(0, 1), dim=-1)
+            img_pose_feats = F.normalize(img_features_flatten.transpose(0, 1), dim=-1)
+            mutual_info = torch.matmul(pc_pose_feats, img_pose_feats.transpose(0, 1)) / temp
+            soft_matching_matrix = F.softmax(mutual_info, dim=-1)
+            img_xy_grid = img_xy_flatten.transpose(0, 1)
+            predicted_xy = torch.matmul(soft_matching_matrix, img_xy_grid)
             # [3, 128]
             pc_xyz_projection=torch.mm(K_4,(torch.mm(P[0:3,0:3],pc_xyz_inline)+P[0:3,3:]))
             depth = pc_xyz_projection[2, :]
@@ -266,6 +273,14 @@ if __name__=='__main__':
 
             # loss_desc = coarse_circle_loss(img_features_flatten_inline,pc_features_inline,correspondence_mask)
             loss_desc,dists=desc_loss(img_features_flatten_inline,pc_features_inline,correspondence_mask,pos_margin = opt.pos_margin,neg_margin = opt.neg_margin)
+
+            # soft correspondence regression loss
+            target_xy = img_xy_flatten_inline.transpose(0, 1)
+            valid_mask = depth_mask > 0
+            if valid_mask.any():
+                loss_soft_corr = F.smooth_l1_loss(predicted_xy[valid_mask], target_xy[valid_mask])
+            else:
+                loss_soft_corr = target_xy.new_zeros(())
             
             coarse_pc_inline_score = torch.squeeze(coarse_pc_score[:, :, pc_kpt_idx])
             coarse_pc_outline_score = torch.squeeze(coarse_pc_score[:, :, pc_outline_idx])
@@ -294,7 +309,7 @@ if __name__=='__main__':
                 fine_recall = torch.sum(recall_num) / opt.num_kpt
                 writer.add_scalar('fine_recall', fine_recall, int(global_step / 100.0))
             loss_fine = fine_circle_loss(fine_img_feature_patch, fine_pc_inline_feature, relative_index, opt.num_kpt)
-            base_loss = loss_desc + loss_coarse + loss_fine
+            base_loss = loss_desc + loss_coarse + loss_fine + opt.soft_corr_weight * loss_soft_corr
             loss = base_loss
             pose_loss = None
             pose_rot_err = None
@@ -304,24 +319,14 @@ if __name__=='__main__':
                 and epoch >= opt.pose_warmup_epoch
             ):
                 try:
-                    temp = max(opt.soft_corr_temperature, 1e-6)
                     valid_indices = torch.nonzero(depth_mask, as_tuple=False).squeeze(-1)
                     if valid_indices.numel() >= opt.min_pose_keypoints:
                         pc_pose_xyz = pc_xyz_inline[:, valid_indices]
-                        pc_pose_feats = pc_features_inline[:, valid_indices]
-                        pc_pose_feats = F.normalize(pc_pose_feats.transpose(0, 1), dim=-1)
-                        img_pose_feats = F.normalize(img_features_flatten.transpose(0, 1), dim=-1)
-                        mutual_info = torch.matmul(
-                            pc_pose_feats,
-                            img_pose_feats.transpose(0, 1)
-                        ) / temp
-                        soft_matching_matrix = F.softmax(mutual_info, dim=-1)
-                        img_xy_grid = img_xy_flatten.transpose(0, 1)
-                        predicted_xy = torch.matmul(soft_matching_matrix, img_xy_grid)
+                        predicted_xy_valid = predicted_xy[valid_indices]
                         ones = torch.ones(
-                            predicted_xy.size(0), 1, device=predicted_xy.device
+                            predicted_xy_valid.size(0), 1, device=predicted_xy_valid.device
                         )
-                        y_homo = torch.cat([predicted_xy, ones], dim=1)
+                        y_homo = torch.cat([predicted_xy_valid, ones], dim=1)
                         K4_inv = torch.inverse(K_4)
                         y_norm = torch.matmul(y_homo, K4_inv.t())[:, :2]
                         x_points = pc_pose_xyz.transpose(0, 1)
@@ -367,6 +372,7 @@ if __name__=='__main__':
             writer.add_scalar("loss:", loss, global_step)
             writer.add_scalar('loss_desc:', loss_desc, global_step)
             writer.add_scalar('loss_coarse:', loss_coarse.detach().cpu().numpy(), global_step)
+            writer.add_scalar('loss_soft_corr:', loss_soft_corr.detach().cpu().item(), global_step)
             writer.add_scalar('loss_fine:', loss_fine.detach().cpu().numpy(), global_step)
             if pose_loss is not None:
                 writer.add_scalar('loss_pose:', pose_loss.detach().cpu().item(), global_step)
